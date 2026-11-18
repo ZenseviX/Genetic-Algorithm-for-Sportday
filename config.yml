@@ -11,3 +11,5 @@ mutation_rate: 0.3
 dept_weight: 5
 gender_weight: 5
 physical_weight: 2
+# Stop after this many generations without improvement (0 = disable).
+patience: 60

@@ -14,6 +14,7 @@ DEFAULTS = {
     "seed": 42, "population_size": 200, "generations": 300,
     "elite_size": 5, "tournament_size": 3, "mutation_rate": 0.3,
     "dept_weight": 5.0, "gender_weight": 5.0, "physical_weight": 2.0,
+    "patience": 60,
 }
 
 
@@ -27,11 +28,11 @@ def load_config(path: Path) -> dict:
         if unknown:
             raise ValueError(f"Unknown configuration keys: {sorted(unknown)}")
         config.update(settings)
-    for name in ("population_size", "generations", "elite_size", "tournament_size"):
+    for name in ("population_size", "generations", "elite_size", "tournament_size", "patience"):
         if type(config[name]) is not int:
             raise ValueError(f"{name} must be an integer")
-    if config["population_size"] < 2 or config["generations"] < 1:
-        raise ValueError("population_size must be >= 2; generations must be >= 1")
+    if config["population_size"] < 2 or config["generations"] < 1 or config["patience"] < 0:
+        raise ValueError("population_size >= 2, generations >= 1, patience >= 0 required")
     if not 1 <= config["elite_size"] < config["population_size"]:
         raise ValueError("elite_size must be between 1 and population_size - 1")
     if not 1 <= config["tournament_size"] <= config["population_size"]:
@@ -92,43 +93,50 @@ def optimize(df: pd.DataFrame, cfg: dict) -> tuple[np.ndarray, list[float]]:
     rng = np.random.default_rng(cfg["seed"])
     n = len(df)
     target_ones = n - n // 2
-    departments = pd.get_dummies(df["department"]).to_numpy(dtype=float)
-    genders = pd.get_dummies(df["gender"]).to_numpy(dtype=float)
-    physical = df[["weight", "height", "age", "bmi"]].to_numpy(dtype=float)
-    # Normalize physical features so height (cm) does not dominate age/BMI.
-    spread = physical.std(axis=0)
-    spread[spread == 0] = 1.0
-    physical = (physical - physical.mean(axis=0)) / spread
+    departments = pd.get_dummies(df["department"]).to_numpy(dtype=np.float64)
+    genders = pd.get_dummies(df["gender"]).to_numpy(dtype=np.float64)
+    physical = df[["weight", "height", "age", "bmi"]].to_numpy(dtype=np.float64)
+    # All four physical measures contribute comparably regardless of their units.
+    scale = physical.std(axis=0)
+    scale[scale == 0] = 1.0
+    physical = (physical - physical.mean(axis=0)) / scale
+
+    # Compute category counts and physical sums in one matrix multiplication.
+    nd, ng = departments.shape[1], genders.shape[1]
+    features = np.concatenate((departments, genders, physical), axis=1)
+    totals = features.sum(axis=0)
+    count_a, count_b = n // 2, target_ones
+    physical_factor = float(cfg["physical_weight"])
 
     def score_population(chromosomes: np.ndarray) -> np.ndarray:
-        """Compute all candidate scores via NumPy matrix products (no row-wise pandas)."""
-        # Every chromosome has a fixed count of zeroes and ones.
-        # Matrix multiplication counts Team B members in each category.
-        members_b = chromosomes.astype(np.float64)
-        dept_b = members_b @ departments
-        gender_b = members_b @ genders
-        dept_gap = np.abs(departments.sum(axis=0) - 2 * dept_b).sum(axis=1)
-        gender_gap = np.abs(genders.sum(axis=0) - 2 * gender_b).sum(axis=1)
-        size_b = target_ones
-        size_a = n - size_b
-        sum_b = members_b @ physical
-        sum_a = physical.sum(axis=0) - sum_b
-        physical_gap = np.abs(sum_a / size_a - sum_b / size_b).sum(axis=1)
-        return (cfg["dept_weight"] * dept_gap
-                + cfg["gender_weight"] * gender_gap
-                + cfg["physical_weight"] * physical_gap)
+        # Chromosomes always contain exactly count_b ones.
+        sums_b = chromosomes @ features
+        category_gaps = np.abs(totals[:nd + ng] - 2.0 * sums_b[:, :nd + ng])
+        physical_b = sums_b[:, nd + ng:]
+        physical_gap = np.abs((totals[nd + ng:] - physical_b) / count_a
+                              - physical_b / count_b).sum(axis=1)
+        return (float(cfg["dept_weight"]) * category_gaps[:, :nd].sum(axis=1)
+                + float(cfg["gender_weight"]) * category_gaps[:, nd:].sum(axis=1)
+                + physical_factor * physical_gap)
 
     population = [balanced_chromosome(n, rng) for _ in range(cfg["population_size"])]
     best_score = float("inf")
     best = population[0].copy()
     history: list[float] = []
+    stagnant = 0
     for _ in range(cfg["generations"]):
         scores = score_population(np.asarray(population, dtype=np.int8))
         indices = np.argsort(scores)
         if scores[indices[0]] < best_score:
             best_score = float(scores[indices[0]])
             best = population[int(indices[0])].copy()
+            stagnant = 0
+        else:
+            stagnant += 1
         history.append(best_score)
+        # Optional early stopping: patience=0 runs all generations.
+        if cfg["patience"] and stagnant >= cfg["patience"]:
+            break
         next_generation = [population[int(i)].copy() for i in indices[: cfg["elite_size"]]]
 
         def select() -> np.ndarray:
