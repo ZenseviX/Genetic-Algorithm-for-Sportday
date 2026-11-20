@@ -167,24 +167,195 @@ def write_results(df: pd.DataFrame, history: list[float], output_dir: Path) -> N
     gender_counts = pd.crosstab(df["Team"], df["gender"])
     summary = summary.join(gender_counts)
     summary.to_csv(output_dir / "fairness_summary.csv", encoding="utf-8-sig")
+    team_order = ["Team A", "Team B"]
+    comparison_columns = ("age", "weight", "height")
+    team_averages = df.groupby("Team", sort=True)[list(comparison_columns)].mean()
+    comparison_rows = []
+    for column in comparison_columns:
+        team_a = float(team_averages.loc["Team A", column])
+        team_b = float(team_averages.loc["Team B", column])
+        difference = abs(team_a - team_b)
+        comparison_rows.append({
+            "Metric": column,
+            "Team_A_Avg": team_a,
+            "Team_B_Avg": team_b,
+            "Absolute_Difference": difference,
+            "Difference_Percent_of_Overall_Avg": (
+                difference / float(df[column].mean()) * 100
+            ),
+        })
+    initial_fitness = history[0]
+    final_fitness = history[-1]
+    fitness_improvement = initial_fitness - final_fitness
+    convergence = pd.DataFrame([{
+        "Generations_Run": len(history),
+        "Initial_Fitness": initial_fitness,
+        "Final_Fitness": final_fitness,
+        "Fitness_Improvement": fitness_improvement,
+        "Improvement_Percent": fitness_improvement / initial_fitness * 100,
+    }])
+    convergence.to_csv(output_dir / "convergence_summary.csv", index=False, encoding="utf-8-sig")
+    pd.DataFrame(comparison_rows).to_csv(
+        output_dir / "team_comparison.csv", index=False, encoding="utf-8-sig"
+    )
     with pd.ExcelWriter(output_dir / "Sports_Day_Teams.xlsx", engine="openpyxl") as writer:
         df.to_excel(writer, sheet_name="All Employees", index=False)
         summary.to_excel(writer, sheet_name="Summary")
         pd.crosstab(df["department"], df["Team"]).to_excel(writer, sheet_name="Departments")
+        pd.DataFrame(comparison_rows).to_excel(writer, sheet_name="Team Comparison", index=False)
+        convergence.to_excel(writer, sheet_name="Convergence", index=False)
 
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    fig, axes = plt.subplots(2, 2, figsize=(12, 8))
-    axes[0, 0].plot(np.arange(1, len(history) + 1), history)
-    axes[0, 0].set(title="Best Fitness (lower is better)", xlabel="Generation", ylabel="Penalty")
-    pd.crosstab(df["department"], df["Team"]).plot.bar(ax=axes[0, 1], title="Department Distribution")
-    pd.crosstab(df["gender"], df["Team"]).plot.bar(ax=axes[1, 0], title="Gender Distribution")
-    df.groupby("Team")["bmi"].mean().plot.bar(ax=axes[1, 1], title="Average BMI")
-    axes[1, 1].set_ylabel("BMI")
+    fig, axes = plt.subplots(2, 3, figsize=(18, 10))
+    gender_order = sorted(df["gender"].unique())
+    gender_colors = {
+        gender: plt.get_cmap("Set2")(index % 8)
+        for index, gender in enumerate(gender_order)
+    }
+    x = np.arange(len(team_order))
+    bar_width = 0.8 / len(gender_order)
+
+    def grouped_bars(axis, values: pd.DataFrame, title: str, ylabel: str) -> None:
+        for index, gender in enumerate(gender_order):
+            heights = values[gender].to_numpy(dtype=float)
+            bars = axis.bar(
+                x + (index - (len(gender_order) - 1) / 2) * bar_width,
+                heights,
+                bar_width,
+                label=gender,
+                color=gender_colors[gender],
+            )
+            for bar, value in zip(bars, heights):
+                if np.isfinite(value):
+                    axis.text(
+                        bar.get_x() + bar.get_width() / 2,
+                        value,
+                        f"{value:.1f}" if not float(value).is_integer() else f"{value:.0f}",
+                        ha="center",
+                        va="bottom",
+                        fontsize=9,
+                    )
+        axis.set(
+            title=title,
+            ylabel=ylabel,
+           xticks=x,
+            xticklabels=team_order,
+        )
+        axis.grid(axis="y", alpha=0.25)
+        axis.set_axisbelow(True)
+        axis.legend(title="Gender")
+
+    gender_counts = (
+        pd.crosstab(df["Team"], df["gender"])
+        .reindex(index=team_order, columns=gender_order, fill_value=0)
+    )
+    grouped_bars(axes[0, 0], gender_counts, "Male/Female Count by Team", "People")
+
+    for axis, column, title, ylabel in (
+        (axes[0, 1], "age", "Average Age by Team and Gender", "Age (years)"),
+        (axes[0, 2], "weight", "Average Weight by Team and Gender", "Weight (kg)"),
+        (axes[1, 0], "height", "Average Height by Team and Gender", "Height (cm)"),
+    ):
+        averages = (
+            df.pivot_table(
+                index="Team",
+                columns="gender",
+                values=column,
+                aggfunc="mean",
+            )
+            .reindex(index=team_order, columns=gender_order)
+        )
+        grouped_bars(axis, averages, title, ylabel)
+
+    axes[1, 1].plot(np.arange(1, len(history) + 1), history, color="#4472C4", linewidth=2)
+    axes[1, 1].set(
+        title="Fitness Improvement (lower is better)",
+        xlabel="Generation",
+        ylabel="Penalty",
+    )
+    axes[1, 1].grid(alpha=0.25)
+    axes[1, 1].set_axisbelow(True)
+    axes[1, 2].axis("off")
+    axes[1, 2].text(
+        0.02,
+        0.95,
+        (
+            "Convergence Summary\n\n"
+            f"Generations run: {len(history)}\n"
+            f"Initial fitness: {initial_fitness:.4f}\n"
+            f"Final fitness: {final_fitness:.4f}\n"
+            f"Improvement: {fitness_improvement:.4f}\n"
+            f"Improvement: {fitness_improvement / initial_fitness * 100:.2f}%"
+        ),
+        va="top",
+        fontsize=12,
+        bbox={"boxstyle": "round,pad=0.6", "facecolor": "#F2F2F2", "edgecolor": "#BFBFBF"},
+    )
+    fig.suptitle("Sports Day Team Comparison", fontsize=16, fontweight="bold")
     fig.tight_layout()
     fig.savefig(output_dir / "fairness_charts.png", dpi=160)
+    plt.close(fig)
+
+    generations = np.arange(1, len(history) + 1)
+    fig, axis = plt.subplots(figsize=(11, 6))
+    axis.plot(
+        generations,
+        history,
+        color="#4472C4",
+        linewidth=2.5,
+        marker="o",
+        markersize=3,
+        markevery=max(1, len(history) // 20),
+    )
+    axis.scatter(
+        [generations[0], generations[-1]],
+        [history[0], history[-1]],
+        color=["#ED7D31", "#70AD47"],
+        zorder=3,
+        s=70,
+    )
+    axis.annotate(
+        f"Start: {history[0]:.2f}",
+        (generations[0], history[0]),
+        xytext=(10, 10),
+        textcoords="offset points",
+        color="#C55A11",
+    )
+    axis.annotate(
+        f"Final: {history[-1]:.2f}",
+        (generations[-1], history[-1]),
+        xytext=(-70, 15),
+        textcoords="offset points",
+        color="#548235",
+    )
+    axis.set(
+        title="Genetic Algorithm Convergence",
+        xlabel="Generation",
+        ylabel="Fitness (lower is better)",
+        xlim=(1, len(history) + 5),
+        ylim=(0, initial_fitness * 1.08),
+    )
+    axis.grid(alpha=0.25)
+    axis.set_axisbelow(True)
+    axis.text(
+        0.98,
+        0.95,
+        (
+            f"Generations: {len(history)}\n"
+            f"Start: {initial_fitness:.2f}\n"
+            f"Final: {final_fitness:.2f}\n"
+            f"Improvement: {fitness_improvement / initial_fitness * 100:.2f}%"
+        ),
+        transform=axis.transAxes,
+        ha="right",
+        va="top",
+        bbox={"boxstyle": "round,pad=0.5", "facecolor": "white", "alpha": 0.9},
+    )
+    fig.tight_layout()
+    fig.savefig(output_dir / "convergence_chart.png", dpi=180)
     plt.close(fig)
 
 
